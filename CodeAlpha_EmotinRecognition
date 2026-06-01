@@ -1,0 +1,698 @@
+!pip install gradio librosa scikit-learn numpy soundfile
+!pip install --upgrade gradio
+from google.colab import files
+
+uploaded = files.upload()
+"""
+============================================================
+  EMOTION RECOGNITION FROM SPEECH
+  Deep Learning Pipeline: MFCCs + CNN-LSTM Hybrid Model
+  Datasets: RAVDESS, TESS, EMO-DB (compatible)
+============================================================
+
+SETUP:
+    pip install librosa numpy pandas scikit-learn tensorflow
+                matplotlib seaborn tqdm soundfile
+
+USAGE:
+    1. Download RAVDESS dataset from Zenodo (free)
+    2. Set DATASET_PATH below
+    3. Run: python emotion_recognition_speech.py
+"""
+
+import os
+import glob
+import numpy as np
+import pandas as pd
+import librosa
+import librosa.display
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings("ignore")
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.metrics import classification_report, confusion_matrix
+
+import tensorflow as tf
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.layers import (
+    Conv1D, MaxPooling1D, LSTM, Dense, Dropout,
+    BatchNormalization, GlobalAveragePooling1D,
+    Input, Bidirectional, Flatten, Reshape,
+    MultiHeadAttention, LayerNormalization, Add
+)
+from tensorflow.keras.callbacks import (
+    EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+)
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.optimizers import Adam
+
+# ─────────────────────────────────────────────
+#   CONFIGURATION
+# ─────────────────────────────────────────────
+DATASET_PATH = "./RAVDESS"      # ← change to your dataset path
+MODEL_SAVE_PATH = "./emotion_model.keras"
+SAMPLE_RATE = 22050
+DURATION = 3                    # seconds per clip (pad/trim to this)
+N_MFCC = 40                     # number of MFCC coefficients
+N_MELS = 128
+HOP_LENGTH = 512
+N_FFT = 2048
+BATCH_SIZE = 32
+EPOCHS = 80
+LEARNING_RATE = 1e-3
+TEST_SIZE = 0.2
+VAL_SIZE = 0.1
+RANDOM_STATE = 42
+
+# RAVDESS emotion codes → labels
+RAVDESS_EMOTIONS = {
+    "01": "neutral",
+    "02": "calm",
+    "03": "happy",
+    "04": "sad",
+    "05": "angry",
+    "06": "fearful",
+    "07": "disgust",
+    "08": "surprised"
+}
+
+# TESS: encoded in filename prefix (e.g., OAF_angry_xxx.wav)
+TESS_EMOTIONS = ["angry", "disgust", "fear", "happy", "neutral", "pleasant_surprise", "sad"]
+
+# EMO-DB emotion codes
+EMODB_EMOTIONS = {
+    "W": "angry", "L": "bored", "E": "disgust",
+    "A": "fearful", "F": "happy", "T": "sad", "N": "neutral"
+}
+
+
+# ─────────────────────────────────────────────
+#   FEATURE EXTRACTION
+# ─────────────────────────────────────────────
+def load_audio(file_path: str, sr: int = SAMPLE_RATE, duration: float = DURATION):
+    """Load audio file and pad/trim to fixed duration."""
+    signal, _ = librosa.load(file_path, sr=sr, duration=duration)
+    target_length = sr * duration
+    if len(signal) < target_length:
+        signal = np.pad(signal, (0, target_length - len(signal)))
+    else:
+        signal = signal[:target_length]
+    return signal
+
+
+def extract_features(signal: np.ndarray, sr: int = SAMPLE_RATE) -> np.ndarray:
+    """
+    Extract a rich feature vector from an audio signal.
+
+    Features extracted:
+      - MFCCs (40 coefficients) + delta + delta-delta → shape (40, T, 3)
+      - Mel Spectrogram                               → shape (128, T)
+      - Chroma STFT                                   → shape (12, T)
+      - Spectral Contrast                             → shape (7, T)
+      - Zero Crossing Rate                            → shape (1, T)
+      - RMS Energy                                    → shape (1, T)
+
+    Returns concatenated feature matrix of shape (T, F) for sequence models.
+    """
+    # MFCCs
+    mfccs = librosa.feature.mfcc(y=signal, sr=sr, n_mfcc=N_MFCC,
+                                  n_fft=N_FFT, hop_length=HOP_LENGTH)
+    mfccs_delta = librosa.feature.delta(mfccs)
+    mfccs_delta2 = librosa.feature.delta(mfccs, order=2)
+
+    # Mel Spectrogram (log-scale)
+    mel_spec = librosa.feature.melspectrogram(y=signal, sr=sr, n_mels=N_MELS,
+                                               n_fft=N_FFT, hop_length=HOP_LENGTH)
+    mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+
+    # Chroma
+    chroma = librosa.feature.chroma_stft(y=signal, sr=sr,
+                                          n_fft=N_FFT, hop_length=HOP_LENGTH)
+
+    # Spectral Contrast
+    contrast = librosa.feature.spectral_contrast(y=signal, sr=sr,
+                                                  n_fft=N_FFT, hop_length=HOP_LENGTH)
+
+    # Zero Crossing Rate
+    zcr = librosa.feature.zero_crossing_rate(signal, hop_length=HOP_LENGTH)
+
+    # RMS Energy
+    rms = librosa.feature.rms(y=signal, hop_length=HOP_LENGTH)
+
+    # Normalise each feature independently
+    def norm(x):
+        std = x.std(axis=1, keepdims=True)
+        std[std == 0] = 1
+        return (x - x.mean(axis=1, keepdims=True)) / std
+
+    features = np.vstack([
+        norm(mfccs),          # (40, T)
+        norm(mfccs_delta),    # (40, T)
+        norm(mfccs_delta2),   # (40, T)
+        norm(mel_spec_db),    # (128, T)
+        norm(chroma),         # (12, T)
+        norm(contrast),       # (7, T)
+        norm(zcr),            # (1, T)
+        norm(rms),            # (1, T)
+    ])                        # → (269, T)
+
+    return features.T         # → (T, 269)  time-steps × features
+
+
+def extract_mfcc_only(signal: np.ndarray, sr: int = SAMPLE_RATE) -> np.ndarray:
+    """
+    Lightweight MFCC-only extraction (40 + delta + delta2 = 120 features).
+    Faster training for quick experiments.
+    """
+    mfccs = librosa.feature.mfcc(y=signal, sr=sr, n_mfcc=N_MFCC,
+                                  n_fft=N_FFT, hop_length=HOP_LENGTH)
+    delta = librosa.feature.delta(mfccs)
+    delta2 = librosa.feature.delta(mfccs, order=2)
+    features = np.concatenate([mfccs, delta, delta2], axis=0)  # (120, T)
+    # Normalize
+    features = (features - features.mean()) / (features.std() + 1e-8)
+    return features.T  # (T, 120)
+
+
+# ─────────────────────────────────────────────
+#   DATASET LOADERS
+# ─────────────────────────────────────────────
+def load_ravdess(dataset_path: str, use_full_features: bool = False):
+    """
+    Load RAVDESS dataset.
+    Directory structure expected:
+        dataset_path/
+            Actor_01/
+                03-01-01-01-01-01-01.wav
+            Actor_02/
+                ...
+    Filename format: modality-vocal_channel-emotion-intensity-statement-repetition-actor
+    """
+    files = glob.glob(os.path.join(dataset_path, "**", "*.wav"), recursive=True)
+    if not files:
+        raise FileNotFoundError(f"No .wav files found in {dataset_path}")
+
+    data, labels = [], []
+    extract_fn = extract_features if use_full_features else extract_mfcc_only
+
+    for f in tqdm(files, desc="Loading RAVDESS"):
+        fname = os.path.basename(f)
+        parts = fname.replace(".wav", "").split("-")
+        if len(parts) < 3:
+            continue
+        emotion_code = parts[2]
+        emotion = RAVDESS_EMOTIONS.get(emotion_code)
+        if emotion is None:
+            continue
+        try:
+            signal = load_audio(f)
+            feat = extract_fn(signal)
+            data.append(feat)
+            labels.append(emotion)
+        except Exception as e:
+            print(f"  Skipping {f}: {e}")
+
+    return data, labels
+
+
+def load_tess(dataset_path: str, use_full_features: bool = False):
+    """
+    Load TESS dataset.
+    Directory structure: dataset_path/<emotion>/<actor>_<emotion>_<word>.wav
+    """
+    files = glob.glob(os.path.join(dataset_path, "**", "*.wav"), recursive=True)
+    data, labels = [], []
+    extract_fn = extract_features if use_full_features else extract_mfcc_only
+
+    for f in tqdm(files, desc="Loading TESS"):
+        fname = os.path.basename(f).lower()
+        emotion = None
+        for em in TESS_EMOTIONS:
+            if em in fname:
+                emotion = em
+                break
+        if emotion is None:
+            continue
+        try:
+            signal = load_audio(f)
+            feat = extract_fn(signal)
+            data.append(feat)
+            labels.append(emotion)
+        except Exception as e:
+            print(f"  Skipping {f}: {e}")
+
+    return data, labels
+
+
+def load_emodb(dataset_path: str, use_full_features: bool = False):
+    """
+    Load EMO-DB dataset.
+    Filenames: e.g., 03a01Wa.wav — 7th character is the emotion code.
+    """
+    files = glob.glob(os.path.join(dataset_path, "*.wav"))
+    data, labels = [], []
+    extract_fn = extract_features if use_full_features else extract_mfcc_only
+
+    for f in tqdm(files, desc="Loading EMO-DB"):
+        fname = os.path.basename(f)
+        if len(fname) < 7:
+            continue
+        code = fname[6].upper()
+        emotion = EMODB_EMOTIONS.get(code)
+        if emotion is None:
+            continue
+        try:
+            signal = load_audio(f)
+            feat = extract_fn(signal)
+            data.append(feat)
+            labels.append(emotion)
+        except Exception as e:
+            print(f"  Skipping {f}: {e}")
+
+    return data, labels
+
+
+# ─────────────────────────────────────────────
+#   PAD / TRIM SEQUENCES
+# ─────────────────────────────────────────────
+def pad_sequences(data: list, max_len: int = None) -> np.ndarray:
+    """Zero-pad or trim all feature matrices to the same time length."""
+    if max_len is None:
+        max_len = max(x.shape[0] for x in data)
+    padded = []
+    for x in data:
+        T, F = x.shape
+        if T >= max_len:
+            padded.append(x[:max_len])
+        else:
+            pad = np.zeros((max_len - T, F))
+            padded.append(np.vstack([x, pad]))
+    return np.array(padded)  # (N, max_len, F)
+
+
+# ─────────────────────────────────────────────
+#   MODEL ARCHITECTURES
+# ─────────────────────────────────────────────
+def build_cnn_lstm(input_shape: tuple, num_classes: int) -> Model:
+    """
+    CNN-LSTM hybrid model:
+      Conv1D layers extract local temporal patterns →
+      Bidirectional LSTM captures long-range dependencies →
+      Dense classifier
+    """
+    inputs = Input(shape=input_shape, name="audio_features")
+
+    # ── CNN blocks ──────────────────────────────
+    x = Conv1D(64, kernel_size=3, padding="same", activation="relu")(inputs)
+    x = BatchNormalization()(x)
+    x = MaxPooling1D(pool_size=2)(x)
+    x = Dropout(0.2)(x)
+
+    x = Conv1D(128, kernel_size=3, padding="same", activation="relu")(x)
+    x = BatchNormalization()(x)
+    x = MaxPooling1D(pool_size=2)(x)
+    x = Dropout(0.2)(x)
+
+    x = Conv1D(256, kernel_size=3, padding="same", activation="relu")(x)
+    x = BatchNormalization()(x)
+    x = MaxPooling1D(pool_size=2)(x)
+    x = Dropout(0.2)(x)
+
+    # ── Bidirectional LSTM ───────────────────────
+    x = Bidirectional(LSTM(128, return_sequences=True))(x)
+    x = Dropout(0.3)(x)
+    x = Bidirectional(LSTM(64, return_sequences=False))(x)
+    x = Dropout(0.3)(x)
+
+    # ── Classifier head ─────────────────────────
+    x = Dense(256, activation="relu")(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.4)(x)
+    x = Dense(128, activation="relu")(x)
+    x = Dropout(0.3)(x)
+    outputs = Dense(num_classes, activation="softmax", name="emotion")(x)
+
+    model = Model(inputs, outputs, name="CNN_BiLSTM")
+    return model
+
+
+def build_cnn_only(input_shape: tuple, num_classes: int) -> Model:
+    """Pure CNN model using global average pooling — fast and effective."""
+    inputs = Input(shape=input_shape)
+
+    x = Conv1D(64,  3, padding="same", activation="relu")(inputs)
+    x = BatchNormalization()(x)
+    x = MaxPooling1D(2)(x)
+    x = Dropout(0.2)(x)
+
+    x = Conv1D(128, 3, padding="same", activation="relu")(x)
+    x = BatchNormalization()(x)
+    x = MaxPooling1D(2)(x)
+    x = Dropout(0.2)(x)
+
+    x = Conv1D(256, 3, padding="same", activation="relu")(x)
+    x = BatchNormalization()(x)
+    x = MaxPooling1D(2)(x)
+    x = Dropout(0.2)(x)
+
+    x = Conv1D(512, 3, padding="same", activation="relu")(x)
+    x = BatchNormalization()(x)
+    x = GlobalAveragePooling1D()(x)
+
+    x = Dense(256, activation="relu")(x)
+    x = Dropout(0.4)(x)
+    x = Dense(128, activation="relu")(x)
+    x = Dropout(0.3)(x)
+    outputs = Dense(num_classes, activation="softmax")(x)
+
+    return Model(inputs, outputs, name="CNN_Only")
+
+
+def build_lstm_only(input_shape: tuple, num_classes: int) -> Model:
+    """Pure Bidirectional LSTM model."""
+    inputs = Input(shape=input_shape)
+
+    x = Bidirectional(LSTM(128, return_sequences=True, dropout=0.2))(inputs)
+    x = Bidirectional(LSTM(128, return_sequences=True, dropout=0.2))(x)
+    x = Bidirectional(LSTM(64,  return_sequences=False, dropout=0.2))(x)
+
+    x = Dense(256, activation="relu")(x)
+    x = Dropout(0.4)(x)
+    x = Dense(128, activation="relu")(x)
+    x = Dropout(0.3)(x)
+    outputs = Dense(num_classes, activation="softmax")(x)
+
+    return Model(inputs, outputs, name="BiLSTM_Only")
+
+
+def build_transformer(input_shape: tuple, num_classes: int,
+                       num_heads: int = 4, ff_dim: int = 128, num_layers: int = 3) -> Model:
+    """
+    Transformer encoder for speech emotion — cutting-edge approach.
+    Multi-Head Self-Attention over time-steps.
+    """
+    inputs = Input(shape=input_shape)
+
+    x = Dense(128, activation="relu")(inputs)  # project features → d_model=128
+
+    for _ in range(num_layers):
+        # Multi-Head Attention
+        attn_out = MultiHeadAttention(num_heads=num_heads, key_dim=32)(x, x)
+        x = LayerNormalization(epsilon=1e-6)(Add()([x, attn_out]))
+        # Feed-Forward
+        ff = Dense(ff_dim, activation="relu")(x)
+        ff = Dense(128)(ff)
+        x = LayerNormalization(epsilon=1e-6)(Add()([x, ff]))
+        x = Dropout(0.1)(x)
+
+    x = GlobalAveragePooling1D()(x)
+    x = Dense(128, activation="relu")(x)
+    x = Dropout(0.3)(x)
+    outputs = Dense(num_classes, activation="softmax")(x)
+
+    return Model(inputs, outputs, name="Transformer_Encoder")
+
+
+# ─────────────────────────────────────────────
+#   TRAINING PIPELINE
+# ─────────────────────────────────────────────
+def compile_and_train(model: Model, X_train, y_train, X_val, y_val,
+                       num_classes: int, epochs: int = EPOCHS):
+    """Compile, attach callbacks, and train the model."""
+    model.compile(
+        optimizer=Adam(learning_rate=LEARNING_RATE),
+        loss="categorical_crossentropy",
+        metrics=["accuracy"]
+    )
+    model.summary()
+
+    callbacks = [
+        EarlyStopping(monitor="val_accuracy", patience=15,
+                      restore_best_weights=True, verbose=1),
+        ReduceLROnPlateau(monitor="val_loss", factor=0.5,
+                          patience=7, min_lr=1e-6, verbose=1),
+        ModelCheckpoint(MODEL_SAVE_PATH, monitor="val_accuracy",
+                        save_best_only=True, verbose=1),
+    ]
+
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=epochs,
+        batch_size=BATCH_SIZE,
+        callbacks=callbacks,
+        verbose=1
+    )
+    return history
+
+
+# ─────────────────────────────────────────────
+#   EVALUATION & VISUALISATION
+# ─────────────────────────────────────────────
+def plot_training_history(history, save_path: str = "training_history.png"):
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle("Training History — Speech Emotion Recognition", fontsize=14, fontweight="bold")
+
+    # Accuracy
+    axes[0].plot(history.history["accuracy"],     label="Train Acc", linewidth=2)
+    axes[0].plot(history.history["val_accuracy"], label="Val Acc",   linewidth=2, linestyle="--")
+    axes[0].set_title("Accuracy"); axes[0].set_xlabel("Epoch"); axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+
+    # Loss
+    axes[1].plot(history.history["loss"],     label="Train Loss", linewidth=2)
+    axes[1].plot(history.history["val_loss"], label="Val Loss",   linewidth=2, linestyle="--")
+    axes[1].set_title("Loss"); axes[1].set_xlabel("Epoch"); axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    print(f"Saved → {save_path}")
+
+
+def plot_confusion_matrix(y_true, y_pred, class_names: list,
+                           save_path: str = "confusion_matrix.png"):
+    cm = confusion_matrix(y_true.argmax(axis=1), y_pred.argmax(axis=1))
+    cm_norm = cm.astype("float") / cm.sum(axis=1, keepdims=True)
+
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm_norm, annot=True, fmt=".2f", cmap="Blues",
+                xticklabels=class_names, yticklabels=class_names,
+                linewidths=0.5)
+    plt.title("Normalised Confusion Matrix", fontsize=14, fontweight="bold")
+    plt.xlabel("Predicted"); plt.ylabel("True")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.show()
+    print(f"Saved → {save_path}")
+
+
+def evaluate_model(model: Model, X_test, y_test, label_encoder: LabelEncoder):
+    """Full evaluation with metrics, confusion matrix, and per-class report."""
+    loss, acc = model.evaluate(X_test, y_test, verbose=0)
+    print(f"\n{'='*50}")
+    print(f"  TEST ACCURACY : {acc*100:.2f}%")
+    print(f"  TEST LOSS     : {loss:.4f}")
+    print(f"{'='*50}\n")
+
+    y_pred = model.predict(X_test, verbose=0)
+    class_names = label_encoder.classes_
+
+    print("Per-Class Report:")
+    print(classification_report(
+        y_test.argmax(axis=1),
+        y_pred.argmax(axis=1),
+        target_names=class_names
+    ))
+
+    plot_confusion_matrix(y_test, y_pred, class_names)
+    return y_pred
+
+
+# ─────────────────────────────────────────────
+#   REAL-TIME INFERENCE
+# ─────────────────────────────────────────────
+def predict_emotion(model: Model, audio_path: str,
+                    label_encoder: LabelEncoder,
+                    max_len: int,
+                    use_full_features: bool = False) -> dict:
+    """
+    Predict emotion for a single audio file.
+
+    Returns:
+        dict with keys: 'emotion', 'confidence', 'probabilities'
+    """
+    signal = load_audio(audio_path)
+    feat = (extract_features if use_full_features else extract_mfcc_only)(signal)
+
+    # Pad/trim
+    T, F = feat.shape
+    if T >= max_len:
+        feat = feat[:max_len]
+    else:
+        feat = np.vstack([feat, np.zeros((max_len - T, F))])
+
+    X = feat[np.newaxis, ...]  # (1, T, F)
+    probs = model.predict(X, verbose=0)[0]
+
+    emotion_idx = probs.argmax()
+    return {
+        "emotion": label_encoder.classes_[emotion_idx],
+        "confidence": float(probs[emotion_idx]),
+        "probabilities": {
+            label_encoder.classes_[i]: float(probs[i])
+            for i in range(len(label_encoder.classes_))
+        }
+    }
+
+
+# ─────────────────────────────────────────────
+#   DEMO / SYNTHETIC DATA
+# ─────────────────────────────────────────────
+def generate_synthetic_dataset(n_samples: int = 400, n_classes: int = 6,
+                                time_steps: int = 130, n_features: int = 120):
+    """
+    Generate synthetic data to run the full pipeline without a real dataset.
+    Replace this with load_ravdess() / load_tess() / load_emodb() for real training.
+    """
+    print("⚠  Using SYNTHETIC data for demonstration.")
+    print("   Replace with load_ravdess() for real emotion recognition.\n")
+    emotions = ["happy", "sad", "angry", "fearful", "neutral", "disgust"][:n_classes]
+    X, y = [], []
+    for i in range(n_samples):
+        cls = i % n_classes
+        # Different frequency / amplitude patterns per class
+        t = np.linspace(0, 1, time_steps)
+        signal = (
+            np.sin(2 * np.pi * (cls + 1) * t * 3)
+            + 0.3 * np.random.randn(time_steps)
+        )
+        feat = np.tile(signal[:, None], (1, n_features)) + 0.1 * np.random.randn(time_steps, n_features)
+        X.append(feat)
+        y.append(emotions[cls])
+    return np.array(X), y
+
+
+# ─────────────────────────────────────────────
+#   MAIN
+# ─────────────────────────────────────────────
+def main():
+    tf.random.set_seed(RANDOM_STATE)
+    np.random.seed(RANDOM_STATE)
+
+    print("=" * 60)
+    print("  SPEECH EMOTION RECOGNITION — CNN-BiLSTM Pipeline")
+    print("=" * 60)
+
+    # ── 1. Load data ─────────────────────────────
+    # Uncomment the dataset you have downloaded:
+
+    # data, labels = load_ravdess(DATASET_PATH)     # ← RAVDESS
+    # data, labels = load_tess(DATASET_PATH)        # ← TESS
+    # data, labels = load_emodb(DATASET_PATH)       # ← EMO-DB
+
+    # Synthetic demo (no download required)
+    X, labels = generate_synthetic_dataset(n_samples=600)
+
+    if isinstance(X, list):
+        # Real data: pad variable-length sequences
+        max_len = max(x.shape[0] for x in X)
+        X = pad_sequences(X, max_len=max_len)
+    else:
+        max_len = X.shape[1]
+
+    print(f"\nDataset shape : {X.shape}")
+    print(f"Label counts  : {pd.Series(labels).value_counts().to_dict()}")
+
+    # ── 2. Encode labels ─────────────────────────
+    le = LabelEncoder()
+    y_encoded = le.fit_transform(labels)
+    num_classes = len(le.classes_)
+    y_cat = to_categorical(y_encoded, num_classes)
+
+    print(f"\nClasses ({num_classes}): {list(le.classes_)}")
+
+    # ── 3. Train / Val / Test split ──────────────
+    X_temp, X_test, y_temp, y_test = train_test_split(
+        X, y_cat, test_size=TEST_SIZE, random_state=RANDOM_STATE,
+        stratify=y_encoded
+    )
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_temp, y_temp, test_size=VAL_SIZE / (1 - TEST_SIZE),
+        random_state=RANDOM_STATE,
+        stratify=y_temp.argmax(axis=1)
+    )
+
+    print(f"\nTrain : {X_train.shape[0]} | Val : {X_val.shape[0]} | Test : {X_test.shape[0]}")
+
+    input_shape = (X_train.shape[1], X_train.shape[2])
+
+    # ── 4. Build model ───────────────────────────
+    # Choose architecture:
+    model = build_cnn_lstm(input_shape, num_classes)       # ← recommended
+    # model = build_cnn_only(input_shape, num_classes)
+    # model = build_lstm_only(input_shape, num_classes)
+    # model = build_transformer(input_shape, num_classes)
+
+    # ── 5. Train ─────────────────────────────────
+    history = compile_and_train(model, X_train, y_train,
+                                 X_val, y_val, num_classes)
+
+    # ── 6. Evaluate ──────────────────────────────
+    y_pred = evaluate_model(model, X_test, y_test, le)
+    plot_training_history(history)
+
+    # ── 7. Single-file inference demo ────────────
+    # result = predict_emotion(model, "path/to/audio.wav", le, max_len)
+    # print(f"\nPredicted: {result['emotion']}  ({result['confidence']*100:.1f}%)")
+    # for emotion, prob in sorted(result['probabilities'].items(),
+    #                              key=lambda x: -x[1]):
+    #     bar = "█" * int(prob * 30)
+    #     print(f"  {emotion:12s}  {bar} {prob*100:5.1f}%")
+
+    print("\n✓ Pipeline complete. Model saved to:", MODEL_SAVE_PATH)
+
+
+if __name__ == "__main__":
+    main()
+
+import gradio as gr
+import librosa
+import numpy as np
+import pickle
+
+model = pickle.load(open("model.pkl", "rb"))
+
+def predict(audio_path):
+    try:
+        audio, sr = librosa.load(audio_path, sr=None)
+
+        mfcc = librosa.feature.mfcc(
+            y=audio,
+            sr=sr,
+            n_mfcc=40
+        )
+
+        mfcc = np.mean(mfcc.T, axis=0)
+        mfcc = mfcc.reshape(1, -1)
+
+        prediction = model.predict(mfcc)[0]
+
+        return f"🎤 Predicted Emotion: {prediction}"
+
+    except Exception as e:
+        return f"❌ Error: {e}"
+
+demo = gr.Interface(
+    fn=predict,
+    inputs=gr.Audio(type="filepath"),
+    outputs="text",
+    title="Speech Emotion Recognition"
+)
+
+demo.launch(share=True)
